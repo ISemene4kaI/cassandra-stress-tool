@@ -35,6 +35,8 @@ cargo clippy --locked -- -D warnings
 docker build -t mini-cassandra-loadgen:ci .
 ```
 
+The Docker context is trimmed by `.dockerignore`; docs, k8s manifests, Git metadata, and local build artifacts are not sent to the builder.
+
 ## Docker
 
 ```bash
@@ -50,6 +52,7 @@ docker run --rm \
 
 Edit `k8s/deployment.yaml` and set `CASSANDRA_CONTACT_POINTS` for the current migration phase.
 `APP_RPS_PER_POD` is per replica; with the default `replicas: 2`, total intended traffic is `2 * APP_RPS_PER_POD`.
+For rehearsal, pin the image to an immutable tag such as `ghcr.io/isemene4kai/cassandra-stress-tool:v1.0.3`. Use `latest` only for development.
 
 ```bash
 kubectl apply -f k8s/deployment.yaml

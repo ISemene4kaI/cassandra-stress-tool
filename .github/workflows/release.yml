@@ -33,6 +33,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked -- -D warnings
 
+      - name: Verify tag matches Cargo version
+        id: version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "tag_version=${TAG_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+          test "$TAG_VERSION" = "$CARGO_VERSION"
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -49,6 +58,10 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.cargo_version }}
+            REVISION=${{ github.sha }}
+            SOURCE=https://github.com/${{ github.repository }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.ref_name }}
             ${{ steps.image.outputs.name }}:latest
