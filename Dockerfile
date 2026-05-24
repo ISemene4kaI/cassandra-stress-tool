@@ -8,7 +8,7 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 
-ARG VERSION=1.0.3
+ARG VERSION=1.0.4
 ARG REVISION=unknown
 ARG SOURCE=https://github.com/ISemene4kaI/cassandra-stress-tool
 

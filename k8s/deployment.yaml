@@ -62,7 +62,9 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: mini-cassandra-loadgen
-          image: mini-cassandra-loadgen:latest
+          # For local development, replace this with mini-cassandra-loadgen:latest.
+          # For migration rehearsal, prefer immutable GHCR tags.
+          image: ghcr.io/isemene4kai/cassandra-stress-tool:v1.0.4
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
