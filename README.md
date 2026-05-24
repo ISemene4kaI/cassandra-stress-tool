@@ -37,7 +37,7 @@ Main success criteria:
 | `APP_PAYLOAD_BYTES` | `4096` | Random payload size for writes. |
 | `APP_WORKERS` | `32` | Number of async workers per pod. |
 | `APP_BUCKETS` | `256` | Bucket range for writes and recent reads. |
-| `APP_HISTORICAL_READ_ENABLED` | `false` | Enables explicit historical-read mode, currently implemented as `random_miss_probe` without a known id list. |
+| `APP_HISTORICAL_READ_ENABLED` | `false` | Enables historical-read-shaped traffic, still implemented as `random_miss_probe` without a known id list. Not historical migration validation. |
 | `APP_HISTORICAL_BUCKETS` | `APP_BUCKETS` | Bucket range for `random_miss_probe`. |
 | `APP_RECONNECT_AFTER_CONSECUTIVE_ERRORS` | `10` | Reset the Cassandra session after this many consecutive operation errors. `0` disables operation-error session reset. |
 | `APP_READY_MAX_AGE_SECONDS` | `30` | `/readyz` freshness window for the last successful Cassandra operation. |
