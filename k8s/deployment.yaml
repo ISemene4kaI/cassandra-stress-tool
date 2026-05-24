@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mini-cassandra-loadgen-config
+  labels:
+    app: mini-cassandra-loadgen
+data:
+  # Switch CASSANDRA_CONTACT_POINTS during migration:
+  # 1) VM Cassandra: "vm-cassandra-1.example.com:9042,vm-cassandra-2.example.com:9042"
+  # 2) ZDM Proxy: "zdm-proxy.datastax.svc.cluster.local:9042"
+  # 3) target k8s Cassandra: "cassandra-dc1-service.cassandra.svc.cluster.local:9042"
+  CASSANDRA_CONTACT_POINTS: "zdm-proxy.datastax.svc.cluster.local:9042"
+  CASSANDRA_LOCAL_DC: "dc1"
+  CASSANDRA_KEYSPACE: "zdm_test"
+  CASSANDRA_CONSISTENCY: "LOCAL_QUORUM"
+  CASSANDRA_TLS_ENABLED: "false"
+  APP_RPS: "1000"
+  APP_READ_RATIO: "70"
+  APP_WRITE_RATIO: "30"
+  APP_PAYLOAD_BYTES: "4096"
+  APP_WORKERS: "32"
+  APP_BUCKETS: "256"
+  APP_METRICS_ADDR: "0.0.0.0:8080"
+  APP_LOG_EVERY_N_SUCCESS: "1000"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mini-cassandra-loadgen-secret
+  labels:
+    app: mini-cassandra-loadgen
+type: Opaque
+stringData:
+  CASSANDRA_USERNAME: ""
+  CASSANDRA_PASSWORD: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mini-cassandra-loadgen
+  labels:
+    app: mini-cassandra-loadgen
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mini-cassandra-loadgen
+  template:
+    metadata:
+      labels:
+        app: mini-cassandra-loadgen
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: mini-cassandra-loadgen
+          image: mini-cassandra-loadgen:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: mini-cassandra-loadgen-config
+            - secretRef:
+                name: mini-cassandra-loadgen-secret
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+

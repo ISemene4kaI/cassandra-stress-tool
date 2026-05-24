@@ -1,0 +1,76 @@
+# Runbook
+
+## Local Run
+
+```bash
+cargo run --release
+```
+
+Example with explicit Cassandra contact points:
+
+```bash
+CASSANDRA_CONTACT_POINTS="127.0.0.1:9042" \
+CASSANDRA_LOCAL_DC="dc1" \
+APP_RPS="100" \
+cargo run --release
+```
+
+HTTP endpoints:
+
+```bash
+curl -s localhost:8080/healthz
+curl -i localhost:8080/readyz
+curl -s localhost:8080/metrics
+```
+
+## Docker
+
+```bash
+docker build -t mini-cassandra-loadgen:latest .
+docker run --rm \
+  -p 8080:8080 \
+  -e CASSANDRA_CONTACT_POINTS="host.docker.internal:9042" \
+  -e CASSANDRA_LOCAL_DC="dc1" \
+  mini-cassandra-loadgen:latest
+```
+
+## Kubernetes
+
+Edit `k8s/deployment.yaml` and set `CASSANDRA_CONTACT_POINTS` for the current migration phase.
+
+```bash
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+kubectl apply -f k8s/servicemonitor.yaml
+```
+
+Check rollout and readiness:
+
+```bash
+kubectl rollout status deploy/mini-cassandra-loadgen
+kubectl get pods -l app=mini-cassandra-loadgen
+kubectl logs -l app=mini-cassandra-loadgen --tail=100
+```
+
+Port-forward metrics:
+
+```bash
+kubectl port-forward svc/mini-cassandra-loadgen 8080:8080
+curl -s localhost:8080/metrics
+```
+
+## Migration Flow
+
+1. Run against origin VM Cassandra and establish a clean baseline.
+2. Switch `CASSANDRA_CONTACT_POINTS` to ZDM Proxy.
+3. Watch metrics and logs during dual-write/read routing phases.
+4. Switch `CASSANDRA_CONTACT_POINTS` to target Kubernetes Cassandra.
+5. Keep the app running long enough to catch intermittent routing, DNS, auth, TLS, or consistency issues.
+
+The expected success state is:
+
+- `miniapp_read_errors_total` does not increase
+- `miniapp_write_errors_total` does not increase
+- `miniapp_last_success_timestamp` remains fresh
+- `/readyz` stays `200`
+

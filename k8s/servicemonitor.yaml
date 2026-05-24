@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mini-cassandra-loadgen
+  labels:
+    app: mini-cassandra-loadgen
+spec:
+  selector:
+    matchLabels:
+      app: mini-cassandra-loadgen
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+
