@@ -13,6 +13,8 @@ CASSANDRA_CONTACT_POINTS="127.0.0.1:9042" \
 CASSANDRA_LOCAL_DC="dc1" \
 APP_CREATE_SCHEMA="false" \
 APP_RPS_PER_POD="100" \
+APP_RECONNECT_AFTER_CONSECUTIVE_ERRORS="10" \
+APP_READY_MAX_AGE_SECONDS="30" \
 cargo run --release
 ```
 
@@ -76,3 +78,5 @@ The expected success state is:
 - `miniapp_reads_empty_total{read_source="recent"}` does not increase
 - `miniapp_last_success_timestamp` remains fresh
 - `/readyz` stays `200`
+
+If `/readyz` returns `503`, the body is a reason such as `cassandra_client_not_ready`, `connect_failed`, `schema_check_failed`, `prepare_failed`, `too_many_consecutive_errors`, or `cassandra_operations_stale`.

@@ -2,7 +2,7 @@
 
 Apply this schema separately before migration and keep origin and target identical.
 
-By default the app does not create schema. It only checks that `keyspace.events` is accessible. Set `APP_CREATE_SCHEMA=true` only for local testing or throwaway environments.
+By default the app does not create schema. It only checks that `keyspace.events` is accessible. Use `APP_CREATE_SCHEMA=false` for ZDM rehearsal. Set `APP_CREATE_SCHEMA=true` only for local testing or throwaway environments.
 
 ```sql
 CREATE KEYSPACE IF NOT EXISTS zdm_test

@@ -73,10 +73,15 @@ Every Cassandra error includes:
 
 Recent-key empty reads are logged as errors because they mean a row written by this app could not be read back. `random_miss_probe` empty reads are counted in `miniapp_reads_empty_total` and should not be interpreted as data migration success.
 
-Every `APP_LOG_EVERY_N_SUCCESS` successful operations, the app logs compact counters:
+The compact success log fields are:
 
-- `reads_ok`
+- `reads_found`
+- `reads_empty`
 - `reads_failed`
 - `writes_ok`
 - `writes_failed`
 - `current_rps`
+
+## Metrics Upkeep
+
+This project uses `metrics-exporter-prometheus` with `install_recorder()` and serves `/metrics` from Axum. In the pinned crate version, `PrometheusHandle` does not expose a public `run_upkeep()` method. A small background task periodically calls `render()`, which uses the same snapshot path as `/metrics` and keeps histogram/counter exposition stable between scrapes.

@@ -31,7 +31,6 @@ use tokio::{net::TcpListener, sync::RwLock, task::JoinSet, time};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-const READY_MAX_AGE: Duration = Duration::from_secs(30);
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -54,6 +53,8 @@ struct Config {
     buckets: usize,
     historical_read_enabled: bool,
     historical_buckets: usize,
+    reconnect_after_consecutive_errors: u64,
+    ready_max_age: Duration,
     metrics_addr: SocketAddr,
     log_every_n_success: u64,
     writer_id: String,
@@ -112,6 +113,18 @@ struct AppState {
     prometheus: PrometheusHandle,
     cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>,
     last_success_timestamp: Arc<AtomicU64>,
+    last_unready_reason: Arc<RwLock<String>>,
+    ready_max_age: Duration,
+}
+
+#[derive(Clone)]
+struct RuntimeState {
+    cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>,
+    ring: Arc<RwLock<KeyRing>>,
+    stats: Arc<Stats>,
+    last_success_timestamp: Arc<AtomicU64>,
+    consecutive_errors: Arc<AtomicU64>,
+    last_unready_reason: Arc<RwLock<String>>,
 }
 
 struct CassandraClient {
@@ -122,6 +135,12 @@ struct CassandraClient {
 struct CassandraStatements {
     insert: PreparedStatement,
     select: PreparedStatement,
+}
+
+#[derive(Debug)]
+struct ClientInitError {
+    reason: &'static str,
+    source: anyhow::Error,
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +183,8 @@ async fn main() -> Result<()> {
         create_schema = config.create_schema,
         rps_per_pod = config.rps_per_pod,
         workers = config.workers,
+        reconnect_after_consecutive_errors = config.reconnect_after_consecutive_errors,
+        ready_max_age_seconds = config.ready_max_age.as_secs(),
         "starting mini cassandra downtime detector"
     );
 
@@ -182,31 +203,46 @@ async fn main() -> Result<()> {
     let cassandra = Arc::new(RwLock::new(None));
     let ring = Arc::new(RwLock::new(KeyRing::new(ring_capacity(&config))));
     let stats = Arc::new(Stats::default());
+    let consecutive_errors = Arc::new(AtomicU64::new(0));
     stats
         .last_log_timestamp
         .store(unix_timestamp(), Ordering::Relaxed);
 
     let last_success_timestamp = Arc::new(AtomicU64::new(0));
+    let last_unready_reason = Arc::new(RwLock::new("cassandra_client_not_ready".to_string()));
     gauge!("miniapp_last_success_timestamp").set(0.0);
     gauge!("miniapp_cassandra_ready").set(0.0);
+
+    let runtime_state = RuntimeState {
+        cassandra: Arc::clone(&cassandra),
+        ring: Arc::clone(&ring),
+        stats: Arc::clone(&stats),
+        last_success_timestamp: Arc::clone(&last_success_timestamp),
+        consecutive_errors: Arc::clone(&consecutive_errors),
+        last_unready_reason: Arc::clone(&last_unready_reason),
+    };
 
     let app_state = AppState {
         prometheus,
         cassandra: Arc::clone(&cassandra),
         last_success_timestamp: Arc::clone(&last_success_timestamp),
+        last_unready_reason: Arc::clone(&last_unready_reason),
+        ready_max_age: config.ready_max_age,
     };
 
     let server = tokio::spawn(http_server(app_state, config.metrics_addr));
-    let reconnect = tokio::spawn(reconnect_loop(Arc::clone(&cassandra), config.clone()));
+    let reconnect = tokio::spawn(reconnect_loop(
+        Arc::clone(&cassandra),
+        Arc::clone(&last_unready_reason),
+        Arc::clone(&consecutive_errors),
+        config.clone(),
+    ));
 
     let mut workers = JoinSet::new();
     for worker_id in 0..config.workers {
         workers.spawn(worker_loop(
             worker_id,
-            Arc::clone(&cassandra),
-            Arc::clone(&ring),
-            Arc::clone(&stats),
-            Arc::clone(&last_success_timestamp),
+            runtime_state.clone(),
             config.clone(),
         ));
     }
@@ -296,6 +332,18 @@ impl Config {
             10 * 1024 * 1024,
         )?;
 
+        let reconnect_after_consecutive_errors =
+            env_u64("APP_RECONNECT_AFTER_CONSECUTIVE_ERRORS", 10)?;
+        validate_range(
+            "APP_RECONNECT_AFTER_CONSECUTIVE_ERRORS",
+            reconnect_after_consecutive_errors,
+            0,
+            1_000_000,
+        )?;
+
+        let ready_max_age_seconds = env_u64("APP_READY_MAX_AGE_SECONDS", 30)?;
+        validate_range("APP_READY_MAX_AGE_SECONDS", ready_max_age_seconds, 1, 3600)?;
+
         Ok(Self {
             contact_points,
             local_dc: env_string("CASSANDRA_LOCAL_DC", "dc1"),
@@ -314,6 +362,8 @@ impl Config {
             buckets,
             historical_read_enabled: env_bool("APP_HISTORICAL_READ_ENABLED", false)?,
             historical_buckets,
+            reconnect_after_consecutive_errors,
+            ready_max_age: Duration::from_secs(ready_max_age_seconds),
             metrics_addr: env_string("APP_METRICS_ADDR", "0.0.0.0:8080")
                 .parse()
                 .context("APP_METRICS_ADDR must be a socket address")?,
@@ -323,7 +373,12 @@ impl Config {
     }
 }
 
-async fn reconnect_loop(cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>, config: Config) {
+async fn reconnect_loop(
+    cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>,
+    last_unready_reason: Arc<RwLock<String>>,
+    consecutive_errors: Arc<AtomicU64>,
+    config: Config,
+) {
     let mut backoff = RECONNECT_INITIAL_BACKOFF;
 
     loop {
@@ -337,14 +392,17 @@ async fn reconnect_loop(cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>, co
             Ok(client) => {
                 counter!("miniapp_cassandra_connects_total").increment(1);
                 gauge!("miniapp_cassandra_ready").set(1.0);
+                consecutive_errors.store(0, Ordering::Relaxed);
                 *cassandra.write().await = Some(Arc::new(client));
                 backoff = RECONNECT_INITIAL_BACKOFF;
                 info!("cassandra client ready");
             }
             Err(err) => {
                 gauge!("miniapp_cassandra_ready").set(0.0);
+                *last_unready_reason.write().await = err.reason.to_string();
                 error!(
-                    error = %err,
+                    reason = err.reason,
+                    error = %err.source,
                     contact_points = %config.contact_points.join(","),
                     keyspace = %config.keyspace,
                     backoff_ms = backoff.as_millis(),
@@ -357,14 +415,32 @@ async fn reconnect_loop(cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>, co
     }
 }
 
-async fn build_cassandra_client(config: &Config) -> Result<CassandraClient> {
-    let session = connect(config).await?;
+async fn build_cassandra_client(config: &Config) -> Result<CassandraClient, ClientInitError> {
+    let session = connect(config).await.map_err(|source| ClientInitError {
+        reason: "connect_failed",
+        source,
+    })?;
     if config.create_schema {
-        create_schema(&session, config).await?;
+        create_schema(&session, config)
+            .await
+            .map_err(|source| ClientInitError {
+                reason: "schema_check_failed",
+                source,
+            })?;
     } else {
-        check_schema(&session, config).await?;
+        check_schema(&session, config)
+            .await
+            .map_err(|source| ClientInitError {
+                reason: "schema_check_failed",
+                source,
+            })?;
     }
-    let statements = prepare_statements(&session, config).await?;
+    let statements = prepare_statements(&session, config)
+        .await
+        .map_err(|source| ClientInitError {
+            reason: "prepare_failed",
+            source,
+        })?;
     Ok(CassandraClient {
         session,
         statements,
@@ -458,14 +534,7 @@ async fn prepare_statements(session: &Session, config: &Config) -> Result<Cassan
     Ok(CassandraStatements { insert, select })
 }
 
-async fn worker_loop(
-    worker_id: usize,
-    cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>,
-    ring: Arc<RwLock<KeyRing>>,
-    stats: Arc<Stats>,
-    last_success_timestamp: Arc<AtomicU64>,
-    config: Config,
-) {
+async fn worker_loop(worker_id: usize, state: RuntimeState, config: Config) {
     let mut rng = SmallRng::from_entropy();
     let delay = worker_delay(&config);
     let mut ticker = time::interval(delay);
@@ -475,7 +544,7 @@ async fn worker_loop(
 
     loop {
         ticker.tick().await;
-        let Some(client) = cassandra.read().await.clone() else {
+        let Some(client) = state.cassandra.read().await.clone() else {
             continue;
         };
 
@@ -483,37 +552,16 @@ async fn worker_loop(
         let ratio_total = config.read_ratio + config.write_ratio;
         let dice = rng.gen_range(0..ratio_total);
         if dice < read_threshold {
-            run_read(
-                &client,
-                &cassandra,
-                &ring,
-                &stats,
-                &last_success_timestamp,
-                &config,
-                &mut rng,
-            )
-            .await;
+            run_read(&client, &state, &config, &mut rng).await;
         } else {
-            run_write(
-                &client,
-                &cassandra,
-                &ring,
-                &stats,
-                &last_success_timestamp,
-                &config,
-                &mut rng,
-            )
-            .await;
+            run_write(&client, &state, &config, &mut rng).await;
         }
     }
 }
 
 async fn run_write<R: Rng>(
     client: &CassandraClient,
-    cassandra: &Arc<RwLock<Option<Arc<CassandraClient>>>>,
-    ring: &Arc<RwLock<KeyRing>>,
-    stats: &Stats,
-    last_success_timestamp: &AtomicU64,
+    state: &RuntimeState,
     config: &Config,
     rng: &mut R,
 ) {
@@ -547,31 +595,28 @@ async fn run_write<R: Rng>(
     match result {
         Ok(_) => {
             counter!("miniapp_writes_total").increment(1);
-            stats.writes_ok.fetch_add(1, Ordering::Relaxed);
-            mark_success(last_success_timestamp);
-            ring.write().await.push(WrittenKey { bucket, id });
-            maybe_log_success(stats, config);
+            state.stats.writes_ok.fetch_add(1, Ordering::Relaxed);
+            mark_success(&state.last_success_timestamp, &state.consecutive_errors);
+            state.ring.write().await.push(WrittenKey { bucket, id });
+            maybe_log_success(&state.stats, config);
         }
         Err(err) => {
             counter!("miniapp_write_errors_total").increment(1);
-            stats.writes_failed.fetch_add(1, Ordering::Relaxed);
+            state.stats.writes_failed.fetch_add(1, Ordering::Relaxed);
             log_cassandra_error("write", &err, latency, config);
-            mark_cassandra_unready(cassandra).await;
+            handle_operation_error("write", state, config).await;
         }
     }
 }
 
 async fn run_read<R: Rng>(
     client: &CassandraClient,
-    cassandra: &Arc<RwLock<Option<Arc<CassandraClient>>>>,
-    ring: &Arc<RwLock<KeyRing>>,
-    stats: &Stats,
-    last_success_timestamp: &AtomicU64,
+    state: &RuntimeState,
     config: &Config,
     rng: &mut R,
 ) {
     let (key, source) = {
-        let ring = ring.read().await;
+        let ring = state.ring.read().await;
         if rng.gen_bool(0.70) {
             match ring.random_recent(rng) {
                 Some(key) => (key, ReadSource::Recent),
@@ -601,19 +646,18 @@ async fn run_read<R: Rng>(
                 counter!("miniapp_reads_total", "read_source" => source.as_str()).increment(1);
                 counter!("miniapp_reads_found_total", "read_source" => source.as_str())
                     .increment(1);
-                stats.reads_found.fetch_add(1, Ordering::Relaxed);
-                mark_success(last_success_timestamp);
-                maybe_log_success(stats, config);
+                state.stats.reads_found.fetch_add(1, Ordering::Relaxed);
+                mark_success(&state.last_success_timestamp, &state.consecutive_errors);
+                maybe_log_success(&state.stats, config);
             } else {
                 counter!("miniapp_reads_empty_total", "read_source" => source.as_str())
                     .increment(1);
-                stats.reads_empty.fetch_add(1, Ordering::Relaxed);
-                mark_success(last_success_timestamp);
+                state.stats.reads_empty.fetch_add(1, Ordering::Relaxed);
 
                 if matches!(source, ReadSource::Recent) {
                     counter!("miniapp_read_errors_total", "read_source" => source.as_str())
                         .increment(1);
-                    stats.reads_failed.fetch_add(1, Ordering::Relaxed);
+                    state.stats.reads_failed.fetch_add(1, Ordering::Relaxed);
                     error!(
                         operation = "read",
                         read_source = source.as_str(),
@@ -627,21 +671,50 @@ async fn run_read<R: Rng>(
                         "recently written key returned empty result"
                     );
                 } else {
-                    maybe_log_success(stats, config);
+                    mark_success(&state.last_success_timestamp, &state.consecutive_errors);
+                    maybe_log_success(&state.stats, config);
                 }
             }
         }
         Err(err) => {
             counter!("miniapp_read_errors_total", "read_source" => source.as_str()).increment(1);
-            stats.reads_failed.fetch_add(1, Ordering::Relaxed);
+            state.stats.reads_failed.fetch_add(1, Ordering::Relaxed);
             log_cassandra_error("read", &err, latency, config);
-            mark_cassandra_unready(cassandra).await;
+            handle_operation_error("read", state, config).await;
         }
     }
 }
 
-async fn mark_cassandra_unready(cassandra: &Arc<RwLock<Option<Arc<CassandraClient>>>>) {
+async fn handle_operation_error(operation: &str, state: &RuntimeState, config: &Config) {
+    if config.reconnect_after_consecutive_errors == 0 {
+        return;
+    }
+
+    let errors = state.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
+    if errors >= config.reconnect_after_consecutive_errors {
+        error!(
+            consecutive_errors = errors,
+            threshold = config.reconnect_after_consecutive_errors,
+            operation,
+            contact_points = %config.contact_points.join(","),
+            "consecutive Cassandra operation error threshold reached; resetting session"
+        );
+        mark_cassandra_unready(
+            &state.cassandra,
+            &state.last_unready_reason,
+            "too_many_consecutive_errors",
+        )
+        .await;
+    }
+}
+
+async fn mark_cassandra_unready(
+    cassandra: &Arc<RwLock<Option<Arc<CassandraClient>>>>,
+    last_unready_reason: &Arc<RwLock<String>>,
+    reason: &str,
+) {
     gauge!("miniapp_cassandra_ready").set(0.0);
+    *last_unready_reason.write().await = reason.to_string();
     *cassandra.write().await = None;
 }
 
@@ -669,21 +742,19 @@ async fn healthz() -> &'static str {
 
 async fn readyz(State(state): State<AppState>) -> Response {
     if state.cassandra.read().await.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cassandra client is not ready\n",
-        )
-            .into_response();
+        let reason = state.last_unready_reason.read().await.clone();
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("{reason}\n")).into_response();
     }
 
     let last_success = state.last_success_timestamp.load(Ordering::Relaxed);
     let now = unix_timestamp();
-    if last_success > 0 && now.saturating_sub(last_success) <= READY_MAX_AGE.as_secs() {
+    if last_success > 0 && now.saturating_sub(last_success) <= state.ready_max_age.as_secs() {
         "ready\n".into_response()
     } else {
+        *state.last_unready_reason.write().await = "cassandra_operations_stale".to_string();
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "cassandra operations are stale\n",
+            "cassandra_operations_stale\n",
         )
             .into_response()
     }
@@ -697,6 +768,9 @@ async fn metrics_upkeep_loop(handle: PrometheusHandle) {
     let mut ticker = time::interval(Duration::from_secs(15));
     loop {
         ticker.tick().await;
+        // metrics-exporter-prometheus 0.13 does not expose a public upkeep method
+        // on PrometheusHandle; rendering periodically drives the same snapshot path
+        // used by /metrics and prunes idle data when that feature is configured.
         let _ = handle.render();
     }
 }
@@ -745,8 +819,9 @@ fn random_payload<R: Rng>(size: usize, rng: &mut R) -> String {
         .collect()
 }
 
-fn mark_success(last_success_timestamp: &AtomicU64) {
+fn mark_success(last_success_timestamp: &AtomicU64, consecutive_errors: &AtomicU64) {
     let now = unix_timestamp();
+    consecutive_errors.store(0, Ordering::Relaxed);
     last_success_timestamp.store(now, Ordering::Relaxed);
     gauge!("miniapp_last_success_timestamp").set(now as f64);
 }
