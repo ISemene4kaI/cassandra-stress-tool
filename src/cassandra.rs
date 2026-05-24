@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use metrics::{counter, gauge};
 use scylla::{
-    load_balancing::DefaultPolicy, prepared_statement::PreparedStatement,
+    load_balancing::DefaultPolicy, prepared_statement::PreparedStatement, statement::query::Query,
     transport::execution_profile::ExecutionProfile, transport::session::Session,
     transport::session_builder::SessionBuilder,
 };
@@ -160,7 +160,10 @@ async fn create_schema(session: &Session, config: &Config) -> Result<()> {
 
 async fn check_schema(session: &Session, config: &Config) -> Result<()> {
     let check_cql = format!("SELECT bucket, id FROM {}.events LIMIT 1", config.keyspace);
-    session.query_unpaged(check_cql, &[]).await.context(
+    let mut check_query = Query::new(check_cql);
+    check_query.set_consistency(config.consistency);
+
+    session.query_unpaged(check_query, ()).await.context(
         "schema check failed; apply keyspace/table separately or set APP_CREATE_SCHEMA=true",
     )?;
     Ok(())

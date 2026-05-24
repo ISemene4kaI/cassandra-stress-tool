@@ -26,6 +26,15 @@ curl -i localhost:8080/readyz
 curl -s localhost:8080/metrics
 ```
 
+## Local Checks
+
+```bash
+cargo fmt -- --check
+cargo check --locked
+cargo clippy --locked -- -D warnings
+docker build -t mini-cassandra-loadgen:ci .
+```
+
 ## Docker
 
 ```bash

@@ -1,8 +1,12 @@
 # mini-cassandra-loadgen
 
+[![CI](https://github.com/ISemene4kaI/cassandra-stress-tool/actions/workflows/ci.yml/badge.svg)](https://github.com/ISemene4kaI/cassandra-stress-tool/actions/workflows/ci.yml)
+
 Minimal Rust mini-app for Cassandra VM -> Kubernetes migration rehearsal through DataStax ZDM Proxy.
 
 This is a downtime detector, not a benchmark. It continuously writes and reads a small Cassandra table, keeps running through Cassandra/ZDM outages, logs read/write problems, and exposes Prometheus metrics so migration phases can be checked for visible downtime or data anomalies.
+
+Current release: `v1.0.3`.
 
 Main success criteria:
 
@@ -45,6 +49,24 @@ Main success criteria:
 | `APP_LOG_EVERY_N_SUCCESS` | `1000` | Compact stats log interval. `0` disables. |
 
 Legacy `APP_RPS` is accepted as fallback if `APP_RPS_PER_POD` is unset.
+
+## Local Checks
+
+```bash
+cargo fmt -- --check
+cargo check --locked
+cargo clippy --locked -- -D warnings
+docker build -t mini-cassandra-loadgen:ci .
+```
+
+## CI
+
+The `CI` workflow runs on pull requests and pushes to `main`.
+
+- `rust-checks`: formatting, `cargo check --locked`, and clippy with warnings denied.
+- `docker-build`: builds `mini-cassandra-loadgen:ci` to verify the Dockerfile. It does not push images.
+
+Tag pushes matching `v*` run the `Release` workflow, which repeats Rust checks, builds the Docker image, and pushes `ghcr.io/<owner>/<repo>:<tag>` plus `latest`.
 
 ## Schema
 
