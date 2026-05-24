@@ -21,16 +21,19 @@ use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use rand::{distributions::Alphanumeric, rngs::SmallRng, Rng, SeedableRng};
 use scylla::{
-    load_balancing::DefaultPolicy, prepared_statement::PreparedStatement, statement::Consistency,
+    frame::value::CqlTimestamp, load_balancing::DefaultPolicy,
+    prepared_statement::PreparedStatement, statement::Consistency,
     transport::execution_profile::ExecutionProfile, transport::session::Session,
     transport::session_builder::SessionBuilder,
 };
 use thiserror::Error;
-use tokio::{net::TcpListener, sync::Mutex, task::JoinSet, time};
+use tokio::{net::TcpListener, sync::RwLock, task::JoinSet, time};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const READY_MAX_AGE: Duration = Duration::from_secs(30);
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -42,12 +45,15 @@ struct Config {
     consistency: Consistency,
     consistency_name: String,
     tls_enabled: bool,
-    app_rps: u64,
+    create_schema: bool,
+    rps_per_pod: u64,
     read_ratio: u32,
     write_ratio: u32,
     payload_bytes: usize,
     workers: usize,
     buckets: usize,
+    historical_read_enabled: bool,
+    historical_buckets: usize,
     metrics_addr: SocketAddr,
     log_every_n_success: u64,
     writer_id: String,
@@ -91,7 +97,8 @@ impl KeyRing {
 
 #[derive(Default)]
 struct Stats {
-    reads_ok: AtomicU64,
+    reads_found: AtomicU64,
+    reads_empty: AtomicU64,
     reads_failed: AtomicU64,
     writes_ok: AtomicU64,
     writes_failed: AtomicU64,
@@ -103,12 +110,33 @@ struct Stats {
 #[derive(Clone)]
 struct AppState {
     prometheus: PrometheusHandle,
+    cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>,
     last_success_timestamp: Arc<AtomicU64>,
+}
+
+struct CassandraClient {
+    session: Session,
+    statements: CassandraStatements,
 }
 
 struct CassandraStatements {
     insert: PreparedStatement,
     select: PreparedStatement,
+}
+
+#[derive(Clone, Copy)]
+enum ReadSource {
+    Recent,
+    RandomMissProbe,
+}
+
+impl ReadSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::RandomMissProbe => "random_miss_probe",
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -133,38 +161,49 @@ async fn main() -> Result<()> {
         keyspace = %config.keyspace,
         consistency = %config.consistency_name,
         tls_enabled = config.tls_enabled,
-        app_rps = config.app_rps,
+        create_schema = config.create_schema,
+        rps_per_pod = config.rps_per_pod,
         workers = config.workers,
-        "starting mini cassandra load generator"
+        "starting mini cassandra downtime detector"
     );
+
+    if config.historical_read_enabled {
+        warn!(
+            historical_buckets = config.historical_buckets,
+            "APP_HISTORICAL_READ_ENABLED=true uses random_miss_probe because no historical id list is configured"
+        );
+    }
 
     let prometheus = PrometheusBuilder::new()
         .install_recorder()
         .context("failed to install prometheus recorder")?;
+    let metrics_upkeep = tokio::spawn(metrics_upkeep_loop(prometheus.clone()));
 
-    let session = Arc::new(connect(&config).await?);
-    counter!("miniapp_cassandra_reconnects_total").increment(1);
-
-    ensure_schema(&session, &config).await?;
-    let statements = Arc::new(prepare_statements(&session, &config).await?);
-    let ring = Arc::new(Mutex::new(KeyRing::new(ring_capacity(&config))));
+    let cassandra = Arc::new(RwLock::new(None));
+    let ring = Arc::new(RwLock::new(KeyRing::new(ring_capacity(&config))));
     let stats = Arc::new(Stats::default());
     stats
         .last_log_timestamp
         .store(unix_timestamp(), Ordering::Relaxed);
 
     let last_success_timestamp = Arc::new(AtomicU64::new(0));
+    gauge!("miniapp_last_success_timestamp").set(0.0);
+    gauge!("miniapp_cassandra_ready").set(0.0);
+
     let app_state = AppState {
         prometheus,
+        cassandra: Arc::clone(&cassandra),
         last_success_timestamp: Arc::clone(&last_success_timestamp),
     };
+
+    let server = tokio::spawn(http_server(app_state, config.metrics_addr));
+    let reconnect = tokio::spawn(reconnect_loop(Arc::clone(&cassandra), config.clone()));
 
     let mut workers = JoinSet::new();
     for worker_id in 0..config.workers {
         workers.spawn(worker_loop(
             worker_id,
-            Arc::clone(&session),
-            Arc::clone(&statements),
+            Arc::clone(&cassandra),
             Arc::clone(&ring),
             Arc::clone(&stats),
             Arc::clone(&last_success_timestamp),
@@ -172,15 +211,17 @@ async fn main() -> Result<()> {
         ));
     }
 
-    let server = tokio::spawn(http_server(app_state, config.metrics_addr));
-
     shutdown_signal().await;
     info!("shutdown signal received");
 
     workers.abort_all();
     while workers.join_next().await.is_some() {}
 
+    reconnect.abort();
+    metrics_upkeep.abort();
     server.abort();
+    let _ = reconnect.await;
+    let _ = metrics_upkeep.await;
     let _ = server.await;
 
     info!("shutdown complete");
@@ -230,14 +271,22 @@ impl Config {
             bail!("APP_READ_RATIO + APP_WRITE_RATIO must be greater than 0");
         }
 
-        let app_rps = env_u64("APP_RPS", 1000)?;
-        validate_range("APP_RPS", app_rps, 1, 1_000_000)?;
+        let rps_per_pod = env_u64_with_fallback("APP_RPS_PER_POD", "APP_RPS", 1000)?;
+        validate_range("APP_RPS_PER_POD", rps_per_pod, 1, 1_000_000)?;
 
         let workers = env_usize("APP_WORKERS", 32)?;
         validate_range("APP_WORKERS", workers as u64, 1, 10_000)?;
 
         let buckets = env_usize("APP_BUCKETS", 256)?;
         validate_range("APP_BUCKETS", buckets as u64, 1, 1_000_000)?;
+
+        let historical_buckets = env_usize("APP_HISTORICAL_BUCKETS", buckets)?;
+        validate_range(
+            "APP_HISTORICAL_BUCKETS",
+            historical_buckets as u64,
+            1,
+            1_000_000,
+        )?;
 
         let payload_bytes = env_usize("APP_PAYLOAD_BYTES", 4096)?;
         validate_range(
@@ -256,12 +305,15 @@ impl Config {
             consistency,
             consistency_name,
             tls_enabled,
-            app_rps,
+            create_schema: env_bool("APP_CREATE_SCHEMA", false)?,
+            rps_per_pod,
             read_ratio,
             write_ratio,
             payload_bytes,
             workers,
             buckets,
+            historical_read_enabled: env_bool("APP_HISTORICAL_READ_ENABLED", false)?,
+            historical_buckets,
             metrics_addr: env_string("APP_METRICS_ADDR", "0.0.0.0:8080")
                 .parse()
                 .context("APP_METRICS_ADDR must be a socket address")?,
@@ -269,6 +321,54 @@ impl Config {
             writer_id: env_string("HOSTNAME", "local"),
         })
     }
+}
+
+async fn reconnect_loop(cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>, config: Config) {
+    let mut backoff = RECONNECT_INITIAL_BACKOFF;
+
+    loop {
+        if cassandra.read().await.is_some() {
+            time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        counter!("miniapp_cassandra_connect_attempts_total").increment(1);
+        match build_cassandra_client(&config).await {
+            Ok(client) => {
+                counter!("miniapp_cassandra_connects_total").increment(1);
+                gauge!("miniapp_cassandra_ready").set(1.0);
+                *cassandra.write().await = Some(Arc::new(client));
+                backoff = RECONNECT_INITIAL_BACKOFF;
+                info!("cassandra client ready");
+            }
+            Err(err) => {
+                gauge!("miniapp_cassandra_ready").set(0.0);
+                error!(
+                    error = %err,
+                    contact_points = %config.contact_points.join(","),
+                    keyspace = %config.keyspace,
+                    backoff_ms = backoff.as_millis(),
+                    "cassandra connect/schema/prepare failed; will retry"
+                );
+                time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+async fn build_cassandra_client(config: &Config) -> Result<CassandraClient> {
+    let session = connect(config).await?;
+    if config.create_schema {
+        create_schema(&session, config).await?;
+    } else {
+        check_schema(&session, config).await?;
+    }
+    let statements = prepare_statements(&session, config).await?;
+    Ok(CassandraClient {
+        session,
+        statements,
+    })
 }
 
 async fn connect(config: &Config) -> Result<Session> {
@@ -296,7 +396,7 @@ async fn connect(config: &Config) -> Result<Session> {
     })
 }
 
-async fn ensure_schema(session: &Session, config: &Config) -> Result<()> {
+async fn create_schema(session: &Session, config: &Config) -> Result<()> {
     let create_keyspace = format!(
         "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', '{}': 3}}",
         config.keyspace, config.local_dc
@@ -325,9 +425,17 @@ async fn ensure_schema(session: &Session, config: &Config) -> Result<()> {
     Ok(())
 }
 
+async fn check_schema(session: &Session, config: &Config) -> Result<()> {
+    let check_cql = format!("SELECT bucket, id FROM {}.events LIMIT 1", config.keyspace);
+    session.query_unpaged(check_cql, &[]).await.context(
+        "schema check failed; apply keyspace/table separately or set APP_CREATE_SCHEMA=true",
+    )?;
+    Ok(())
+}
+
 async fn prepare_statements(session: &Session, config: &Config) -> Result<CassandraStatements> {
     let insert_cql = format!(
-        "INSERT INTO {}.events (bucket, id, created_at, payload, writer_id, version) VALUES (?, ?, toTimestamp(now()), ?, ?, ?)",
+        "INSERT INTO {}.events (bucket, id, created_at, payload, writer_id, version) VALUES (?, ?, ?, ?, ?, ?)",
         config.keyspace
     );
     let select_cql = format!(
@@ -352,9 +460,8 @@ async fn prepare_statements(session: &Session, config: &Config) -> Result<Cassan
 
 async fn worker_loop(
     worker_id: usize,
-    session: Arc<Session>,
-    statements: Arc<CassandraStatements>,
-    ring: Arc<Mutex<KeyRing>>,
+    cassandra: Arc<RwLock<Option<Arc<CassandraClient>>>>,
+    ring: Arc<RwLock<KeyRing>>,
     stats: Arc<Stats>,
     last_success_timestamp: Arc<AtomicU64>,
     config: Config,
@@ -368,13 +475,17 @@ async fn worker_loop(
 
     loop {
         ticker.tick().await;
+        let Some(client) = cassandra.read().await.clone() else {
+            continue;
+        };
+
         let read_threshold = config.read_ratio;
         let ratio_total = config.read_ratio + config.write_ratio;
         let dice = rng.gen_range(0..ratio_total);
         if dice < read_threshold {
             run_read(
-                &session,
-                &statements.select,
+                &client,
+                &cassandra,
                 &ring,
                 &stats,
                 &last_success_timestamp,
@@ -384,8 +495,8 @@ async fn worker_loop(
             .await;
         } else {
             run_write(
-                &session,
-                &statements.insert,
+                &client,
+                &cassandra,
                 &ring,
                 &stats,
                 &last_success_timestamp,
@@ -398,9 +509,9 @@ async fn worker_loop(
 }
 
 async fn run_write<R: Rng>(
-    session: &Session,
-    statement: &PreparedStatement,
-    ring: &Arc<Mutex<KeyRing>>,
+    client: &CassandraClient,
+    cassandra: &Arc<RwLock<Option<Arc<CassandraClient>>>>,
+    ring: &Arc<RwLock<KeyRing>>,
     stats: &Stats,
     last_success_timestamp: &AtomicU64,
     config: &Config,
@@ -408,16 +519,19 @@ async fn run_write<R: Rng>(
 ) {
     let bucket = format!("bucket_{}", rng.gen_range(0..config.buckets));
     let id = Uuid::new_v4();
+    let created_at = CqlTimestamp(unix_timestamp_millis());
     let payload = random_payload(config.payload_bytes, rng);
     let started = Instant::now();
 
     gauge!("miniapp_inflight_operations").increment(1.0);
-    let result = session
+    let result = client
+        .session
         .execute_unpaged(
-            statement,
+            &client.statements.insert,
             (
                 bucket.as_str(),
                 id,
+                created_at,
                 payload.as_str(),
                 config.writer_id.as_str(),
                 1_i32,
@@ -435,43 +549,44 @@ async fn run_write<R: Rng>(
             counter!("miniapp_writes_total").increment(1);
             stats.writes_ok.fetch_add(1, Ordering::Relaxed);
             mark_success(last_success_timestamp);
-            ring.lock().await.push(WrittenKey { bucket, id });
+            ring.write().await.push(WrittenKey { bucket, id });
             maybe_log_success(stats, config);
         }
         Err(err) => {
             counter!("miniapp_write_errors_total").increment(1);
             stats.writes_failed.fetch_add(1, Ordering::Relaxed);
             log_cassandra_error("write", &err, latency, config);
+            mark_cassandra_unready(cassandra).await;
         }
     }
 }
 
 async fn run_read<R: Rng>(
-    session: &Session,
-    statement: &PreparedStatement,
-    ring: &Arc<Mutex<KeyRing>>,
+    client: &CassandraClient,
+    cassandra: &Arc<RwLock<Option<Arc<CassandraClient>>>>,
+    ring: &Arc<RwLock<KeyRing>>,
     stats: &Stats,
     last_success_timestamp: &AtomicU64,
     config: &Config,
     rng: &mut R,
 ) {
-    let key = {
-        let ring = ring.lock().await;
+    let (key, source) = {
+        let ring = ring.read().await;
         if rng.gen_bool(0.70) {
-            ring.random_recent(rng)
+            match ring.random_recent(rng) {
+                Some(key) => (key, ReadSource::Recent),
+                None => (random_probe_key(config, rng), ReadSource::RandomMissProbe),
+            }
         } else {
-            None
+            (random_probe_key(config, rng), ReadSource::RandomMissProbe)
         }
-    }
-    .unwrap_or_else(|| WrittenKey {
-        bucket: format!("bucket_{}", rng.gen_range(0..config.buckets)),
-        id: Uuid::new_v4(),
-    });
+    };
 
     let started = Instant::now();
     gauge!("miniapp_inflight_operations").increment(1.0);
-    let result = session
-        .execute_unpaged(statement, (key.bucket.as_str(), key.id))
+    let result = client
+        .session
+        .execute_unpaged(&client.statements.select, (key.bucket.as_str(), key.id))
         .await;
     gauge!("miniapp_inflight_operations").decrement(1.0);
 
@@ -480,18 +595,54 @@ async fn run_read<R: Rng>(
         .record(latency.as_secs_f64());
 
     match result {
-        Ok(_) => {
-            counter!("miniapp_reads_total").increment(1);
-            stats.reads_ok.fetch_add(1, Ordering::Relaxed);
-            mark_success(last_success_timestamp);
-            maybe_log_success(stats, config);
+        Ok(result) => {
+            let rows = result.rows_num().unwrap_or(0);
+            if rows > 0 {
+                counter!("miniapp_reads_total", "read_source" => source.as_str()).increment(1);
+                counter!("miniapp_reads_found_total", "read_source" => source.as_str())
+                    .increment(1);
+                stats.reads_found.fetch_add(1, Ordering::Relaxed);
+                mark_success(last_success_timestamp);
+                maybe_log_success(stats, config);
+            } else {
+                counter!("miniapp_reads_empty_total", "read_source" => source.as_str())
+                    .increment(1);
+                stats.reads_empty.fetch_add(1, Ordering::Relaxed);
+                mark_success(last_success_timestamp);
+
+                if matches!(source, ReadSource::Recent) {
+                    counter!("miniapp_read_errors_total", "read_source" => source.as_str())
+                        .increment(1);
+                    stats.reads_failed.fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        operation = "read",
+                        read_source = source.as_str(),
+                        consistency = %config.consistency_name,
+                        bucket = %key.bucket,
+                        id = %key.id,
+                        latency_ms = latency.as_secs_f64() * 1000.0,
+                        contact_points = %config.contact_points.join(","),
+                        keyspace = %config.keyspace,
+                        timestamp = unix_timestamp(),
+                        "recently written key returned empty result"
+                    );
+                } else {
+                    maybe_log_success(stats, config);
+                }
+            }
         }
         Err(err) => {
-            counter!("miniapp_read_errors_total").increment(1);
+            counter!("miniapp_read_errors_total", "read_source" => source.as_str()).increment(1);
             stats.reads_failed.fetch_add(1, Ordering::Relaxed);
             log_cassandra_error("read", &err, latency, config);
+            mark_cassandra_unready(cassandra).await;
         }
     }
+}
+
+async fn mark_cassandra_unready(cassandra: &Arc<RwLock<Option<Arc<CassandraClient>>>>) {
+    gauge!("miniapp_cassandra_ready").set(0.0);
+    *cassandra.write().await = None;
 }
 
 async fn http_server(state: AppState, addr: SocketAddr) -> Result<()> {
@@ -517,6 +668,14 @@ async fn healthz() -> &'static str {
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {
+    if state.cassandra.read().await.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cassandra client is not ready\n",
+        )
+            .into_response();
+    }
+
     let last_success = state.last_success_timestamp.load(Ordering::Relaxed);
     let now = unix_timestamp();
     if last_success > 0 && now.saturating_sub(last_success) <= READY_MAX_AGE.as_secs() {
@@ -532,6 +691,14 @@ async fn readyz(State(state): State<AppState>) -> Response {
 
 async fn metrics(State(state): State<AppState>) -> String {
     state.prometheus.render()
+}
+
+async fn metrics_upkeep_loop(handle: PrometheusHandle) {
+    let mut ticker = time::interval(Duration::from_secs(15));
+    loop {
+        ticker.tick().await;
+        let _ = handle.render();
+    }
 }
 
 async fn shutdown_signal() {
@@ -557,6 +724,18 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+fn random_probe_key<R: Rng>(config: &Config, rng: &mut R) -> WrittenKey {
+    let bucket_count = if config.historical_read_enabled {
+        config.historical_buckets
+    } else {
+        config.buckets
+    };
+    WrittenKey {
+        bucket: format!("bucket_{}", rng.gen_range(0..bucket_count)),
+        id: Uuid::new_v4(),
     }
 }
 
@@ -588,7 +767,8 @@ fn maybe_log_success(stats: &Stats, config: &Config) {
     let current_rps = (successes.saturating_sub(previous_successes)) as f64 / elapsed as f64;
 
     info!(
-        reads_ok = stats.reads_ok.load(Ordering::Relaxed),
+        reads_found = stats.reads_found.load(Ordering::Relaxed),
+        reads_empty = stats.reads_empty.load(Ordering::Relaxed),
         reads_failed = stats.reads_failed.load(Ordering::Relaxed),
         writes_ok = stats.writes_ok.load(Ordering::Relaxed),
         writes_failed = stats.writes_failed.load(Ordering::Relaxed),
@@ -617,12 +797,12 @@ fn log_cassandra_error<E: std::error::Error>(
 }
 
 fn worker_delay(config: &Config) -> Duration {
-    let secs = config.workers as f64 / config.app_rps as f64;
+    let secs = config.workers as f64 / config.rps_per_pod as f64;
     Duration::from_secs_f64(secs.max(0.001))
 }
 
 fn ring_capacity(config: &Config) -> usize {
-    (config.app_rps as usize)
+    (config.rps_per_pod as usize)
         .saturating_mul(60)
         .clamp(4096, 1_000_000)
 }
@@ -632,6 +812,14 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn unix_timestamp_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -661,6 +849,15 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
         .unwrap_or_else(|_| default.to_string())
         .parse()
         .with_context(|| format!("{name} must be an unsigned integer"))
+}
+
+fn env_u64_with_fallback(name: &str, fallback_name: &str, default: u64) -> Result<u64> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .with_context(|| format!("{name} must be an unsigned integer")),
+        Err(_) => env_u64(fallback_name, default),
+    }
 }
 
 fn env_u32(name: &str, default: u32) -> Result<u32> {

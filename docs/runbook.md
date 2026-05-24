@@ -11,7 +11,8 @@ Example with explicit Cassandra contact points:
 ```bash
 CASSANDRA_CONTACT_POINTS="127.0.0.1:9042" \
 CASSANDRA_LOCAL_DC="dc1" \
-APP_RPS="100" \
+APP_CREATE_SCHEMA="false" \
+APP_RPS_PER_POD="100" \
 cargo run --release
 ```
 
@@ -37,6 +38,7 @@ docker run --rm \
 ## Kubernetes
 
 Edit `k8s/deployment.yaml` and set `CASSANDRA_CONTACT_POINTS` for the current migration phase.
+`APP_RPS_PER_POD` is per replica; with the default `replicas: 2`, total intended traffic is `2 * APP_RPS_PER_POD`.
 
 ```bash
 kubectl apply -f k8s/deployment.yaml
@@ -71,6 +73,6 @@ The expected success state is:
 
 - `miniapp_read_errors_total` does not increase
 - `miniapp_write_errors_total` does not increase
+- `miniapp_reads_empty_total{read_source="recent"}` does not increase
 - `miniapp_last_success_timestamp` remains fresh
 - `/readyz` stays `200`
-

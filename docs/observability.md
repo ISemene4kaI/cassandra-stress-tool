@@ -5,13 +5,17 @@
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `miniapp_reads_total` | counter | Successful read operations. |
+| `miniapp_reads_found_total` | counter | Reads that returned at least one row, labeled by `read_source`. |
+| `miniapp_reads_empty_total` | counter | Reads that returned no rows, labeled by `read_source`. Recent empty reads are anomalies. |
 | `miniapp_writes_total` | counter | Successful write operations. |
-| `miniapp_read_errors_total` | counter | Failed read operations. |
+| `miniapp_read_errors_total` | counter | Failed read operations and recent-key empty anomalies, labeled by `read_source` when available. |
 | `miniapp_write_errors_total` | counter | Failed write operations. |
 | `miniapp_operation_latency_seconds` | histogram | Read/write operation latency, labeled by `operation`. |
 | `miniapp_last_success_timestamp` | gauge | Unix timestamp of the last successful Cassandra operation. |
 | `miniapp_inflight_operations` | gauge | Operations currently waiting on Cassandra. |
-| `miniapp_cassandra_reconnects_total` | counter | Initial successful Cassandra connection count. |
+| `miniapp_cassandra_connect_attempts_total` | counter | Cassandra/ZDM connection attempts. |
+| `miniapp_cassandra_connects_total` | counter | Successful Cassandra/ZDM connections, including reconnects. |
+| `miniapp_cassandra_ready` | gauge | `1` when a session is connected, schema checked, and statements prepared. |
 
 ## Alert Examples
 
@@ -42,6 +46,14 @@ groups:
           severity: critical
         annotations:
           summary: No successful Cassandra operation in the last 30 seconds
+
+      - alert: MiniCassandraLoadgenRecentReadEmpty
+        expr: increase(miniapp_reads_empty_total{read_source="recent"}[1m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Recently written Cassandra row was not found
 ```
 
 ## Logs
@@ -59,6 +71,8 @@ Every Cassandra error includes:
 - `keyspace`
 - `timestamp`
 
+Recent-key empty reads are logged as errors because they mean a row written by this app could not be read back. `random_miss_probe` empty reads are counted in `miniapp_reads_empty_total` and should not be interpreted as data migration success.
+
 Every `APP_LOG_EVERY_N_SUCCESS` successful operations, the app logs compact counters:
 
 - `reads_ok`
@@ -66,4 +80,3 @@ Every `APP_LOG_EVERY_N_SUCCESS` successful operations, the app logs compact coun
 - `writes_ok`
 - `writes_failed`
 - `current_rps`
-

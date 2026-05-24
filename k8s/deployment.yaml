@@ -6,20 +6,27 @@ metadata:
     app: mini-cassandra-loadgen
 data:
   # Switch CASSANDRA_CONTACT_POINTS during migration:
-  # 1) VM Cassandra: "vm-cassandra-1.example.com:9042,vm-cassandra-2.example.com:9042"
-  # 2) ZDM Proxy: "zdm-proxy.datastax.svc.cluster.local:9042"
-  # 3) target k8s Cassandra: "cassandra-dc1-service.cassandra.svc.cluster.local:9042"
+  # 1) VM Cassandra origin:
+  #    CASSANDRA_CONTACT_POINTS: "vm-cassandra-1.example.com:9042,vm-cassandra-2.example.com:9042"
+  # 2) ZDM Proxy:
+  #    CASSANDRA_CONTACT_POINTS: "zdm-proxy.datastax.svc.cluster.local:9042"
+  # 3) target k8s Cassandra:
+  #    CASSANDRA_CONTACT_POINTS: "cassandra-dc1-service.cassandra.svc.cluster.local:9042"
   CASSANDRA_CONTACT_POINTS: "zdm-proxy.datastax.svc.cluster.local:9042"
   CASSANDRA_LOCAL_DC: "dc1"
   CASSANDRA_KEYSPACE: "zdm_test"
   CASSANDRA_CONSISTENCY: "LOCAL_QUORUM"
   CASSANDRA_TLS_ENABLED: "false"
-  APP_RPS: "1000"
+  APP_CREATE_SCHEMA: "false"
+  # Per-pod rate. Total cluster rate is APP_RPS_PER_POD * Deployment replicas.
+  APP_RPS_PER_POD: "1000"
   APP_READ_RATIO: "70"
   APP_WRITE_RATIO: "30"
   APP_PAYLOAD_BYTES: "4096"
   APP_WORKERS: "32"
   APP_BUCKETS: "256"
+  APP_HISTORICAL_READ_ENABLED: "false"
+  APP_HISTORICAL_BUCKETS: "256"
   APP_METRICS_ADDR: "0.0.0.0:8080"
   APP_LOG_EVERY_N_SUCCESS: "1000"
 ---
@@ -84,6 +91,4 @@ spec:
               cpu: 500m
               memory: 512Mi
             limits:
-              cpu: "1"
               memory: 1Gi
-

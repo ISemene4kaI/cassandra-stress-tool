@@ -1,6 +1,8 @@
 # Cassandra Schema
 
-The app runs equivalent `CREATE IF NOT EXISTS` statements on startup.
+Apply this schema separately before migration and keep origin and target identical.
+
+By default the app does not create schema. It only checks that `keyspace.events` is accessible. Set `APP_CREATE_SCHEMA=true` only for local testing or throwaway environments.
 
 ```sql
 CREATE KEYSPACE IF NOT EXISTS zdm_test
@@ -17,7 +19,7 @@ CREATE TABLE IF NOT EXISTS zdm_test.events (
 );
 ```
 
-If `CASSANDRA_KEYSPACE` or `CASSANDRA_LOCAL_DC` are changed, the startup DDL uses those values.
+If `CASSANDRA_KEYSPACE` or `CASSANDRA_LOCAL_DC` are changed and `APP_CREATE_SCHEMA=true`, the startup DDL uses those values.
 
 The table is intentionally simple:
 
@@ -26,4 +28,3 @@ The table is intentionally simple:
 - payload: random text sized by `APP_PAYLOAD_BYTES`
 - `writer_id`: pod hostname or `local`
 - `version`: fixed at `1`
-
