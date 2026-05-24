@@ -59,6 +59,8 @@ cargo clippy --locked -- -D warnings
 docker build -t mini-cassandra-loadgen:ci .
 ```
 
+The Docker build context is intentionally small via `.dockerignore`; only `Cargo.toml`, `Cargo.lock`, and `src/` are needed by the Dockerfile.
+
 ## CI
 
 The `CI` workflow runs on pull requests and pushes to `main`.
@@ -66,7 +68,9 @@ The `CI` workflow runs on pull requests and pushes to `main`.
 - `rust-checks`: formatting, `cargo check --locked`, and clippy with warnings denied.
 - `docker-build`: builds `mini-cassandra-loadgen:ci` to verify the Dockerfile. It does not push images.
 
-Tag pushes matching `v*` run the `Release` workflow, which repeats Rust checks, builds the Docker image, and pushes `ghcr.io/<owner>/<repo>:<tag>` plus `latest`.
+Tag pushes matching `v*` run the `Release` workflow, which repeats Rust checks, verifies that the tag version matches `Cargo.toml`, builds the Docker image, and pushes `ghcr.io/<owner>/<repo>:<tag>` plus `latest`.
+
+For example, tag `v1.0.3` must match `version = "1.0.3"` in `Cargo.toml`.
 
 ## Schema
 
@@ -79,10 +83,13 @@ See [docs/schema.md](docs/schema.md).
 Set the current migration endpoint in [k8s/deployment.yaml](k8s/deployment.yaml):
 
 ```yaml
+image: ghcr.io/isemene4kai/cassandra-stress-tool:v1.0.3
 CASSANDRA_CONTACT_POINTS: "zdm-proxy.datastax.svc.cluster.local:9042"
 APP_CREATE_SCHEMA: "false"
 APP_RPS_PER_POD: "1000"
 ```
+
+For migration rehearsal, prefer immutable image tags such as `v1.0.3`. Use `latest` only for development.
 
 Apply:
 

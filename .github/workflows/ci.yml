@@ -43,4 +43,7 @@ jobs:
           context: .
           push: false
           tags: mini-cassandra-loadgen:ci
-
+          build-args: |
+            VERSION=1.0.3
+            REVISION=${{ github.sha }}
+            SOURCE=https://github.com/${{ github.repository }}
